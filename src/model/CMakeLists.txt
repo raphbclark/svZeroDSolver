@@ -7,6 +7,8 @@ set(lib svzero_model_library)
 
 set(CXXSRCS
   ActivationFunction.cpp
+  ActiveStress.cpp
+  ParameterHolder.cpp
   SphereMaterial.cpp
   BloodVesselRC.cpp
   Block.cpp
@@ -23,6 +25,7 @@ set(CXXSRCS
   ClosedLoopRCRBC.cpp
   DOFHandler.cpp
   FlowReferenceBC.cpp
+  ImpedanceBC.cpp
   Junction.cpp
   Model.cpp
   Node.cpp
@@ -40,6 +43,8 @@ set(CXXSRCS
 
 set(HDRS
   ActivationFunction.h
+  ActiveStress.h
+  ParameterHolder.h
   SphereMaterial.h
   BloodVesselRC.h
   Block.h
@@ -57,6 +62,7 @@ set(HDRS
   ClosedLoopRCRBC.h
   DOFHandler.h
   FlowReferenceBC.h
+  ImpedanceBC.h
   Junction.h
   Model.h
   Node.h
@@ -82,4 +88,3 @@ target_include_directories( ${lib} PUBLIC
 
 target_link_libraries( ${lib} Eigen3::Eigen )
 target_link_libraries( ${lib} nlohmann_json::nlohmann_json )
-

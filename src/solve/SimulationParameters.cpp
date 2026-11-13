@@ -2,6 +2,106 @@
 // University of California, and others. SPDX-License-Identifier: BSD-3-Clause
 #include "SimulationParameters.h"
 
+#include <cmath>
+#include <memory>
+#include <sstream>
+
+#include "ImpedanceBC.h"
+
+namespace {
+
+/**
+ * @brief Block types configured under `closed_loop_blocks` (selected by
+ * `closed_loop_type`) instead of `boundary_conditions`.
+ *
+ * Both create_closed_loop() and get_bc_type_names() use this list, so the
+ * loader states in one place which section each of these blocks belongs to.
+ */
+const std::vector<std::string> kClosedLoopBlockTypes = {
+    "ClosedLoopHeartAndPulmonary"};
+
+/// Join `items` as "A, B, C" for listing valid options in error messages.
+std::string join_names(const std::vector<std::string>& items) {
+  std::ostringstream joined;
+  for (size_t i = 0; i < items.size(); i++) {
+    joined << (i > 0 ? ", " : "") << items[i];
+  }
+  return joined.str();
+}
+
+/**
+ * @brief List the registered block types whose block class is in `classes`.
+ *
+ * Derived from the block factory, so valid-type lists in error messages
+ * can't drift from the blocks that are actually registered. To read a type's
+ * class, one throwaway block is constructed per registered type; block
+ * constructors only initialize members, so this doesn't touch `model`.
+ *
+ * @param model Model whose block factory is queried
+ * @param classes Block classes to include
+ * @param excluded Type names to leave out even if their class matches
+ * @return Matching type names, in the factory's (alphabetical) order
+ */
+std::vector<std::string> get_block_type_names(
+    Model& model, const std::vector<BlockClass>& classes,
+    const std::vector<std::string>& excluded = {}) {
+  std::vector<std::string> type_names;
+  for (const auto& [type_name, factory] : model.block_factory_map) {
+    std::unique_ptr<Block> block(factory(0, &model));
+    const bool class_matches = std::find(classes.begin(), classes.end(),
+                                         block->block_class) != classes.end();
+    const bool is_excluded = std::find(excluded.begin(), excluded.end(),
+                                       type_name) != excluded.end();
+    if (class_matches && !is_excluded) {
+      type_names.push_back(std::string(type_name));
+    }
+  }
+  return type_names;
+}
+
+/**
+ * @brief List the block types that can be used as a `bc_type` (and as the
+ * `type` of an external coupling block).
+ *
+ * These are the boundary_condition and closed_loop block classes, minus
+ * kClosedLoopBlockTypes, which belong under `closed_loop_blocks`.
+ */
+std::vector<std::string> get_bc_type_names(Model& model) {
+  return get_block_type_names(
+      model, {BlockClass::boundary_condition, BlockClass::closed_loop},
+      kClosedLoopBlockTypes);
+}
+
+/**
+ * @brief Throw a load-time error if a block's configured type isn't valid.
+ *
+ * Checking before generate_block() lets the error name the block, the config
+ * section and key to fix, and the valid values. Model::create_block() only
+ * knows the type string.
+ *
+ * @param type Type read from the configuration
+ * @param valid_types Types accepted for this config section and key
+ * @param component Config section the block is in, e.g. "vessels"
+ * @param key Config key the type was read from, e.g. "zero_d_element_type"
+ * @param name Name of the block, as given in the configuration
+ * @param hint Optional sentence appended to the error, e.g. to say which of
+ * the valid values are normally used
+ */
+void check_block_type(const std::string& type,
+                      const std::vector<std::string>& valid_types,
+                      const std::string& component, const std::string& key,
+                      const std::string& name, const std::string& hint = "") {
+  if (std::find(valid_types.begin(), valid_types.end(), type) ==
+      valid_types.end()) {
+    throw std::runtime_error("Block '" + name + "' in " + component +
+                             " has invalid " + key + " '" + type + "'. Valid " +
+                             key + " values are: " + join_names(valid_types) +
+                             "." + (hint.empty() ? "" : " " + hint));
+  }
+}
+
+}  // namespace
+
 bool get_param_scalar(const nlohmann::json& data, const std::string& name,
                       const InputParameter& param, double& val) {
   if (data.contains(name)) {
@@ -40,6 +140,62 @@ bool has_parameter(
   }
   return false;
 }
+
+namespace {
+
+/**
+ * @brief Read a chamber sub-component's parameters from its JSON block into
+ * it.
+ *
+ * @param j JSON block for the component (e.g. "activation_function")
+ * @param comp Component to read parameters into, already created via its
+ * factory with its type-specific input_param_properties
+ * @param component_label Name of the component block, used in error messages
+ * (e.g. "activation_function", "material", "active_stress")
+ * @param chamber_name Name of the chamber the component belongs to, used in
+ * error messages
+ */
+void read_component_params(const nlohmann::json& j, ParameterHolder& comp,
+                           const std::string& component_label,
+                           const std::string& chamber_name) {
+  const auto& props = comp.input_param_properties;
+
+  // Check that all keys defined in the JSON block are valid parameters
+  for (auto& el : j.items()) {
+    if (el.key()[0] == '_' || el.key() == "type") continue;
+    if (!has_parameter(props, el.key())) {
+      throw std::runtime_error("Unknown parameter " + el.key() +
+                               " defined in " + component_label +
+                               " for chamber " + chamber_name);
+    }
+  }
+
+  // Read all parameters declared by the component
+  for (const auto& param : props) {
+    if (!param.second.is_number) continue;
+    if (param.second.is_array) {
+      std::vector<double> val;
+      if (get_param_vector(j, param.first, param.second, val)) {
+        throw std::runtime_error("Array parameter " + param.first +
+                                 " is mandatory in " + component_label +
+                                 " for chamber " + chamber_name);
+      }
+      comp.set_param_vector(param.first, val);
+    } else {
+      double val;
+      if (get_param_scalar(j, param.first, param.second, val)) {
+        throw std::runtime_error("Scalar parameter " + param.first +
+                                 " is mandatory in " + component_label +
+                                 " for chamber " + chamber_name);
+      }
+      comp.set_param(param.first, val);
+    }
+  }
+
+  comp.finalize();
+}
+
+}  // namespace
 
 int generate_block(Model& model, const nlohmann::json& block_params_json,
                    const std::string& block_type, const std::string_view& name,
@@ -146,56 +302,25 @@ std::unique_ptr<ActivationFunction> generate_activation_function(
         "Missing 'activation_function' for chamber " + chamber_name +
         ". Required with structure: {\"type\": \"half_cosine\", \"t_active\": "
         "0.2, \"t_twitch\": 0.3} (or type piecewise_cosine / two_hill / "
-        "double_tanh / wrapping_cosine / fourier with their parameters).");
+        "double_tanh / wrapping_cosine / fourier / piecewise_rate with their "
+        "parameters).");
   }
   if (!j.contains("type") || !j["type"].is_string()) {
     throw std::runtime_error(
         "Missing or invalid 'type' in activation_function for chamber " +
         chamber_name +
         ". Must be one of: half_cosine, piecewise_cosine, two_hill, "
-        "double_tanh, wrapping_cosine, fourier");
+        "double_tanh, wrapping_cosine, fourier, piecewise_rate");
   }
 
   // Extract activation function type
   std::string type_str = j["type"];
-  int err;
 
   // Create an activation function instance with default parameter values for
   // this type, then use its parameter schema for validation and reading.
   auto act_func =
       ActivationFunction::create_default(type_str, model.cardiac_cycle_period);
-  const auto& input_param_properties = act_func->input_param_properties;
-
-  for (auto& el : j.items()) {
-    if (el.key()[0] == '_') {
-      continue;
-    }
-    if (el.key() == "type") {
-      continue;
-    }
-    if (!has_parameter(input_param_properties, el.key())) {
-      throw std::runtime_error("Unknown parameter " + el.key() +
-                               " defined in activation_function for chamber " +
-                               chamber_name);
-    }
-  }
-
-  // Read parameters
-  for (const auto& param : input_param_properties) {
-    if (!param.second.is_number) {
-      continue;
-    }
-    double val;
-    err = get_param_scalar(j, param.first, param.second, val);
-    if (err) {
-      throw std::runtime_error(
-          "Scalar parameter " + param.first +
-          " is mandatory in activation_function for chamber " + chamber_name);
-    }
-    act_func->set_param(param.first, val);
-  }
-
-  act_func->finalize();
+  read_component_params(j, *act_func, "activation_function", chamber_name);
   return act_func;
 }
 
@@ -216,32 +341,31 @@ std::unique_ptr<SphereMaterial> generate_material(
 
   std::string type_str = j["type"];
   auto material = SphereMaterial::create(type_str);
-  const auto& input_param_properties = material->input_param_properties;
-
-  for (auto& el : j.items()) {
-    if (el.key()[0] == '_') continue;
-    if (el.key() == "type") continue;
-    if (!has_parameter(input_param_properties, el.key())) {
-      throw std::runtime_error("Unknown parameter " + el.key() +
-                               " defined in material for chamber " +
-                               chamber_name);
-    }
-  }
-
-  int err;
-  for (const auto& param : input_param_properties) {
-    if (!param.second.is_number) continue;
-    double val;
-    err = get_param_scalar(j, param.first, param.second, val);
-    if (err) {
-      throw std::runtime_error(
-          "Scalar parameter " + param.first +
-          " is mandatory in material for chamber " + chamber_name);
-    }
-    material->set_param(param.first, val);
-  }
-
+  read_component_params(j, *material, "material", chamber_name);
   return material;
+}
+
+std::unique_ptr<ActiveStress> generate_active_stress(
+    const nlohmann::json& j, const std::string& chamber_name) {
+  if (j.is_null() || !j.is_object()) {
+    throw std::runtime_error(
+        "Missing 'active_stress' for chamber " + chamber_name +
+        ". Required with structure: {\"type\": \"strain_independent\", "
+        "\"alpha_max\": 30.0, \"alpha_min\": -30.0, \"sigma_max\": 185e3} "
+        "(or type strain_dependent with E_s, mu, alpha_r, alpha, k_0, "
+        "sigma_0, n0_e_c, n0_values, m0_e_c, m0_values).");
+  }
+  if (!j.contains("type") || !j["type"].is_string()) {
+    throw std::runtime_error(
+        "Missing or invalid 'type' in active_stress for chamber " +
+        chamber_name +
+        ". Must be one of: strain_independent, strain_dependent");
+  }
+
+  std::string type_str = j["type"];
+  auto active_stress = ActiveStress::create(type_str);
+  read_component_params(j, *active_stress, "active_stress", chamber_name);
+  return active_stress;
 }
 
 void validate_input(const nlohmann::json& config) {
@@ -253,11 +377,25 @@ void validate_input(const nlohmann::json& config) {
   }
 }
 
+bool config_has_impedance_bc(const nlohmann::json& config) {
+  if (!config.contains("boundary_conditions") ||
+      !config["boundary_conditions"].is_array()) {
+    return false;
+  }
+  for (const auto& bc_config : config["boundary_conditions"]) {
+    if (bc_config.value("bc_type", "") == "IMPEDANCE") {
+      return true;
+    }
+  }
+  return false;
+}
+
 SimulationParameters load_simulation_params(const nlohmann::json& config) {
   DEBUG_MSG("Loading simulation parameters");
   SimulationParameters sim_params;
   const auto& sim_config = config["simulation_parameters"];
   sim_params.sim_coupled = sim_config.value("coupled_simulation", false);
+  const bool has_impedance = config_has_impedance_bc(config);
 
   if (!sim_params.sim_coupled) {
     sim_params.sim_num_cycles = sim_config["number_of_cardiac_cycles"];
@@ -280,12 +418,34 @@ SimulationParameters load_simulation_params(const nlohmann::json& config) {
     sim_params.sim_pts_per_cycle = sim_params.sim_num_time_steps;
     sim_params.sim_external_step_size =
         sim_config.value("external_step_size", 0.1);
+    if (has_impedance) {
+      if (sim_params.sim_num_time_steps != 2) {
+        throw std::runtime_error(
+            "Coupled configs with IMPEDANCE boundary conditions require "
+            "`simulation_parameters.number_of_time_pts = 2`.");
+      }
+      if (sim_config.contains("number_of_time_pts_per_cardiac_cycle") &&
+          sim_config.value("number_of_time_pts_per_cardiac_cycle", 0) <= 1) {
+        throw std::runtime_error(
+            "Coupled configs with IMPEDANCE boundary conditions require "
+            "`simulation_parameters.number_of_time_pts_per_cardiac_cycle > "
+            "1`.");
+      }
+    }
   }
   sim_params.sim_abs_tol = sim_config.value("absolute_tolerance", 1e-8);
   sim_params.sim_nliter = sim_config.value("maximum_nonlinear_iterations", 30);
   sim_params.sim_max_iter_error_to_warning =
       sim_config.value("max_iter_error_to_warning", false);
   sim_params.sim_steady_initial = sim_config.value("steady_initial", true);
+  if (has_impedance && sim_params.sim_steady_initial) {
+    throw std::runtime_error(
+        "IMPEDANCE boundary conditions are incompatible with steady "
+        "initialization: the convolution kernel is discretized at the "
+        "simulation time-step size, but the steady initial condition is "
+        "solved with `cardiac_period / 10`. Set "
+        "`simulation_parameters.steady_initial = false`.");
+  }
   sim_params.sim_rho_infty = sim_config.value("rho_infty", 0.5);
   sim_params.output_variable_based =
       sim_config.value("output_variable_based", false);
@@ -296,6 +456,25 @@ SimulationParameters load_simulation_params(const nlohmann::json& config) {
   sim_params.sim_cardiac_period = sim_config.value("cardiac_period", -1.0);
   DEBUG_MSG("Finished loading simulation parameters");
   return sim_params;
+}
+
+void resolve_cardiac_cycle_period(Model& model,
+                                  const SimulationParameters& params) {
+  if (params.sim_cardiac_period < 0.0 && model.cardiac_cycle_period < 0.0) {
+    // Defined nowhere; fall back to the default period.
+    model.cardiac_cycle_period = 1.0;
+  } else if (model.cardiac_cycle_period >= 0.0) {
+    // Defined by a model block. Check for an inconsistent definition in
+    // simulation_parameters.
+    if (params.sim_cardiac_period >= 0.0 &&
+        (model.cardiac_cycle_period != params.sim_cardiac_period)) {
+      throw std::runtime_error(
+          "Inconsistent cardiac cycle period defined in parameters");
+    }
+  } else {
+    // Defined only in simulation_parameters.
+    model.cardiac_cycle_period = params.sim_cardiac_period;
+  }
 }
 
 void load_simulation_model(const nlohmann::json& config, Model& model) {
@@ -315,13 +494,18 @@ void load_simulation_model(const nlohmann::json& config, Model& model) {
     create_vessels(model, connections, config, component, vessel_id_map);
   }
 
-  // Create map for boundary conditions to boundary condition type
+  // Create map for boundary conditions to boundary condition type. Validate
+  // each bc_type here, before anything consumes the map: external coupling
+  // blocks are created before the boundary conditions, so an unchecked typo
+  // would otherwise surface as an unrelated coupling error.
   component = "boundary_conditions";
   std::map<std::string, std::string> bc_type_map;
+  const std::vector<std::string> valid_bc_types = get_bc_type_names(model);
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& bc_config = JsonWrapper(config, component, "bc_name", i);
     std::string bc_name = bc_config["bc_name"];
     std::string bc_type = bc_config["bc_type"];
+    check_block_type(bc_type, valid_bc_types, component, "bc_type", bc_name);
     bc_type_map.insert({bc_name, bc_type});
   }
 
@@ -378,6 +562,8 @@ void create_vessels(
     std::vector<std::tuple<std::string, std::string>>& connections,
     const nlohmann::json& config, const std::string& component,
     std::map<int, std::string>& vessel_id_map) {
+  const std::vector<std::string> valid_vessel_types =
+      get_block_type_names(model, {BlockClass::vessel});
   // Loop all vessels
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& vessel_config =
@@ -385,6 +571,8 @@ void create_vessels(
     const auto& vessel_values = vessel_config["zero_d_element_values"];
     const std::string vessel_name = vessel_config["vessel_name"];
     const std::string vessel_type = vessel_config["zero_d_element_type"];
+    check_block_type(vessel_type, valid_vessel_types, component,
+                     "zero_d_element_type", vessel_name);
     vessel_id_map.insert({vessel_config["vessel_id"], vessel_name});
 
     generate_block(model, vessel_values, vessel_type, vessel_name);
@@ -432,6 +620,39 @@ void create_boundary_conditions(Model& model, const nlohmann::json& config,
           model.get_largest_windkessel_time_constant(), time_constant));
     }
 
+    if (block->block_type == BlockType::impedance_bc) {
+      auto* impedance_block = dynamic_cast<ImpedanceBC*>(block);
+      if (impedance_block == nullptr) {
+        throw std::runtime_error(
+            "Internal error: IMPEDANCE block creation failed for " + bc_name +
+            ".");
+      }
+
+      if (!bc_values.contains("z")) {
+        throw std::runtime_error("IMPEDANCE block " + bc_name +
+                                 " is missing required `z` kernel.");
+      }
+      if (!bc_values["z"].is_array()) {
+        throw std::runtime_error("IMPEDANCE block " + bc_name +
+                                 " requires `z` to be an array.");
+      }
+      std::vector<double> z = bc_values["z"].get<std::vector<double>>();
+
+      double pd = bc_values.value("Pd", 0.0);
+      std::string convolution_mode =
+          bc_values.value("convolution_mode", "exact");
+      int num_kernel_terms = bc_values.value("num_kernel_terms", -1);
+
+      // One-cycle sample count, if the configuration states it. Mandatory for
+      // non-coupled runs and optional for coupled ones, where 0 means the
+      // block infers the cycle discretization from cardiac_period / dt.
+      int points_per_cycle = config["simulation_parameters"].value(
+          "number_of_time_pts_per_cardiac_cycle", 0);
+
+      impedance_block->configure(z, pd, convolution_mode, num_kernel_terms,
+                                 points_per_cycle);
+    }
+
     if (block->block_type == BlockType::closed_loop_rcr_bc) {
       if (bc_values["closed_loop_outlet"] == true) {
         closed_loop_bcs.push_back(bc_name);
@@ -449,12 +670,26 @@ void create_external_coupling(
     const nlohmann::json& config, const std::string& component,
     std::map<int, std::string>& vessel_id_map,
     std::map<std::string, std::string>& bc_type_map) {
+  const std::vector<std::string> valid_coupling_types =
+      get_bc_type_names(model);
   // Loop all external coupling blocks
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& coupling_config = JsonWrapper(config, component, "name", i);
     std::string coupling_type = coupling_config["type"];
     std::string coupling_name = coupling_config["name"];
     std::string coupling_loc = coupling_config["location"];
+    // Any boundary condition type loads, but the coupling interface
+    // (update_block_params) only exchanges time series with FLOW and PRESSURE
+    // blocks, so point users at those.
+    check_block_type(coupling_type, valid_coupling_types, component, "type",
+                     coupling_name,
+                     "External solvers normally couple through FLOW or "
+                     "PRESSURE.");
+    if (coupling_loc != "inlet" && coupling_loc != "outlet") {
+      throw std::runtime_error("External coupling block '" + coupling_name +
+                               "' has invalid location '" + coupling_loc +
+                               "'. Valid location values are: inlet, outlet.");
+    }
     bool periodic = coupling_config.value("periodic", true);
     const auto& coupling_values = coupling_config["values"];
     const bool internal = false;
@@ -462,68 +697,70 @@ void create_external_coupling(
     generate_block(model, coupling_values, coupling_type, coupling_name,
                    internal, periodic);
 
-    // Determine the type of connected block
+    // Determine the type of connected block: the closed-loop heart, a
+    // boundary condition (by bc_name), or a vessel (by vessel_name).
     std::string connected_block = coupling_config["connected_block"];
     std::string connected_type;
-    int found_block = 0;
     if (connected_block == "ClosedLoopHeartAndPulmonary") {
       connected_type = "ClosedLoopHeartAndPulmonary";
-      found_block = 1;
+    } else if (auto bc = bc_type_map.find(connected_block);
+               bc != bc_type_map.end()) {
+      connected_type = bc->second;
     } else {
-      try {
-        connected_type = bc_type_map.at(connected_block);
-        found_block = 1;
-      } catch (...) {
-      }
-      if (found_block == 0) {
-        // Search for connected_block in the list of vessel names
-        for (auto const vessel : vessel_id_map) {
-          if (connected_block == vessel.second) {
-            connected_type = "BloodVessel";
-            found_block = 1;
-            break;
-          }
+      for (const auto& vessel : vessel_id_map) {
+        if (connected_block == vessel.second) {
+          connected_type = "BloodVessel";
+          break;
         }
       }
-      if (found_block == 0) {
-        std::cout << "Error! Could not connected type for block: "
-                  << connected_block << std::endl;
-        throw std::runtime_error("Terminating.");
-      }
-    }  // connected_block != "ClosedLoopHeartAndPulmonary"
+    }
+    if (connected_type.empty()) {
+      throw std::runtime_error(
+          "External coupling block '" + coupling_name +
+          "' has connected_block '" + connected_block +
+          "', which is not the bc_name of a boundary condition, the "
+          "vessel_name of a vessel, or ClosedLoopHeartAndPulmonary.");
+    }
+
+    // Each location supports only some connected block types. A block's type
+    // is its bc_type for a boundary condition, or BloodVessel for a vessel.
+    // These lists are also documented on create_external_coupling() in
+    // SimulationParameters.h; update both together.
+    const std::vector<std::string> supported_types =
+        (coupling_loc == "inlet")
+            ? std::vector<std::string>{"RESISTANCE",
+                                       "RCR",
+                                       "IMPEDANCE",
+                                       "ClosedLoopRCR",
+                                       "CORONARY",
+                                       "ClosedLoopCoronaryLeft",
+                                       "ClosedLoopCoronaryRight",
+                                       "BloodVessel"}
+            : std::vector<std::string>{"ClosedLoopRCR",
+                                       "ClosedLoopHeartAndPulmonary",
+                                       "BloodVessel"};
+    if (std::find(supported_types.begin(), supported_types.end(),
+                  connected_type) == supported_types.end()) {
+      throw std::runtime_error(
+          "External coupling block '" + coupling_name + "' (location '" +
+          coupling_loc + "') has connected_block '" + connected_block +
+          "' of type '" + connected_type +
+          "', which is not supported at this location. Supported types for "
+          "location '" +
+          coupling_loc + "' are: " + join_names(supported_types) + ".");
+    }
+
     // Create connections
     if (coupling_loc == "inlet") {
-      std::vector<std::string> possible_types = {"RESISTANCE",
-                                                 "RCR",
-                                                 "ClosedLoopRCR",
-                                                 "SimplifiedRCR",
-                                                 "CORONARY",
-                                                 "ClosedLoopCoronaryLeft",
-                                                 "ClosedLoopCoronaryRight",
-                                                 "BloodVessel"};
-      if (std::find(std::begin(possible_types), std::end(possible_types),
-                    connected_type) == std::end(possible_types)) {
-        throw std::runtime_error(
-            "Error: The specified connection type for inlet"
-            "external_coupling_block is invalid.");
-      }
       connections.push_back({coupling_name, connected_block});
-    } else if (coupling_loc == "outlet") {
-      std::vector<std::string> possible_types = {
-          "ClosedLoopRCR", "ClosedLoopHeartAndPulmonary", "BloodVessel"};
-      if (std::find(std::begin(possible_types), std::end(possible_types),
-                    connected_type) == std::end(possible_types)) {
-        throw std::runtime_error(
-            "Error: The specified connection type for outlet "
-            "external_coupling_block is invalid.");
-      }
-      // Add connection only for closedLoopRCR and BloodVessel. Connection to
+    } else {
+      // Add connection only for ClosedLoopRCR and BloodVessel. Connection to
       // ClosedLoopHeartAndPulmonary will be handled in
       // ClosedLoopHeartAndPulmonary creation.
       if ((connected_type == "ClosedLoopRCR") ||
           (connected_type == "BloodVessel")) {
         connections.push_back({connected_block, coupling_name});
-      }  // connected_type == "ClosedLoopRCR"
+      }
     }  // coupling_loc
   }  // for (size_t i = 0; i < coupling_configs.length(); i++)
 }
@@ -533,12 +770,16 @@ void create_junctions(
     std::vector<std::tuple<std::string, std::string>>& connections,
     const nlohmann::json& config, const std::string& component,
     std::map<int, std::string>& vessel_id_map) {
+  const std::vector<std::string> valid_junction_types =
+      get_block_type_names(model, {BlockClass::junction});
   // Loop all junctions
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& junction_config =
         JsonWrapper(config, component, "junction_name", i);
     std::string j_type = junction_config["junction_type"];
     std::string junction_name = junction_config["junction_name"];
+    check_block_type(j_type, valid_junction_types, component, "junction_type",
+                     junction_name);
 
     if (!junction_config.contains("junction_values")) {
       generate_block(model, {}, j_type, junction_name);
@@ -582,6 +823,9 @@ void create_closed_loop(
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& closed_loop_config = JsonWrapper(config, component, "name", i);
     std::string closed_loop_type = closed_loop_config["closed_loop_type"];
+    check_block_type(closed_loop_type, kClosedLoopBlockTypes, component,
+                     "closed_loop_type",
+                     "entry " + std::to_string(i));  // entries have no name
     if (closed_loop_type == "ClosedLoopHeartAndPulmonary") {
       if (heartpulmonary_block_present == false) {
         heartpulmonary_block_present = true;
@@ -630,11 +874,15 @@ void create_valves(
     Model& model,
     std::vector<std::tuple<std::string, std::string>>& connections,
     const nlohmann::json& config, const std::string& component) {
+  const std::vector<std::string> valid_valve_types =
+      get_block_type_names(model, {BlockClass::valve});
   // Loop all valves
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& valve_config = JsonWrapper(config, component, "name", i);
     std::string valve_type = valve_config["type"];
     std::string valve_name = valve_config["name"];
+    check_block_type(valve_type, valid_valve_types, component, "type",
+                     valve_name);
     generate_block(model, valve_config["params"], valve_type, valve_name);
     connections.push_back(
         {valve_config["params"]["upstream_block"], valve_name});
@@ -659,21 +907,29 @@ void create_chambers(
     }
   }
 
+  const std::vector<std::string> valid_chamber_types =
+      get_block_type_names(model, {BlockClass::chamber});
   for (size_t i = 0; i < config[component].size(); i++) {
     const auto& chamber_config = JsonWrapper(config, component, "name", i);
     std::string chamber_type = chamber_config["type"];
     std::string chamber_name = chamber_config["name"];
+    check_block_type(chamber_type, valid_chamber_types, component, "type",
+                     chamber_name);
     generate_block(model, chamber_config["values"], chamber_type, chamber_name);
 
     auto act_func = generate_activation_function(
         model, chamber_config["activation_function"], chamber_name);
     model.get_block(chamber_name)->set_activation_function(std::move(act_func));
 
-    // Create and set material for chamber types that use one
+    // Create and set material and active stress model for chamber types
+    // that use one
     if (chamber_type == "ChamberSphere") {
-      auto mat =
-          generate_material(chamber_config["material"], chamber_name);
+      auto mat = generate_material(chamber_config["material"], chamber_name);
       model.get_block(chamber_name)->set_material(std::move(mat));
+
+      auto act_stress =
+          generate_active_stress(chamber_config["active_stress"], chamber_name);
+      model.get_block(chamber_name)->set_active_stress(std::move(act_stress));
     }
 
     DEBUG_MSG("Created chamber " << chamber_name);

@@ -14,11 +14,12 @@
 #include <vector>
 
 #include "ActivationFunction.h"
+#include "ActiveStress.h"
 #include "BlockType.h"
-#include "SphereMaterial.h"
 #include "DOFHandler.h"
 #include "Parameter.h"
 #include "SparseSystem.h"
+#include "SphereMaterial.h"
 #include "State.h"
 
 /**
@@ -26,7 +27,7 @@
  * to the global system.
  */
 struct TripletsContributions {
-  TripletsContributions(){};
+  TripletsContributions() {};
   /**
    * @brief Set the number of triplets that the element contributes
    * to the global system.
@@ -34,7 +35,7 @@ struct TripletsContributions {
    * @param E Contributions to E matrix
    * @param D Contributions to dC/dy matrix
    */
-  TripletsContributions(int F, int E, int D) : F(F), E(E), D(D){};
+  TripletsContributions(int F, int E, int D) : F(F), E(E), D(D) {};
   /**
    * @brief Set the number of triplets that the element contributes
    * to the global system.
@@ -155,7 +156,7 @@ class Block {
    *
    * @return std::string Name of the block
    */
-  std::string get_name();
+  std::string get_name() const;
 
   /**
    * @brief Update vessel type of the block
@@ -253,6 +254,34 @@ class Block {
   virtual void post_solve(Eigen::Matrix<double, Eigen::Dynamic, 1>& y);
 
   /**
+   * @brief Accept a converged time-step.
+   *
+   * This hook is called once per accepted integrator step and can be used by
+   * blocks that maintain persistent memory (for example convolution history).
+   *
+   * @param y Accepted state vector
+   */
+  virtual void accept_timestep(
+      const Eigen::Matrix<double, Eigen::Dynamic, 1>& y);
+
+  /**
+   * @brief Get persistent internal state of the block.
+   *
+   * The returned vector must be deterministic and sufficient to restore the
+   * block memory using @ref set_persistent_state.
+   *
+   * @return Persistent state payload
+   */
+  virtual std::vector<double> get_persistent_state() const;
+
+  /**
+   * @brief Restore persistent internal state of the block.
+   *
+   * @param state Persistent state payload from @ref get_persistent_state
+   */
+  virtual void set_persistent_state(const std::vector<double>& state);
+
+  /**
    * @brief Set the gradient of the block residual with respect to the
    * parameters
    *
@@ -299,6 +328,19 @@ class Block {
    */
   virtual void set_activation_function(std::unique_ptr<ActivationFunction> af) {
     (void)af;  // Included to avoid unused parameter warning
+  }
+
+  /**
+   * @brief Set active stress model (for chamber blocks that use one).
+   *
+   * Default no-op. Overridden by ChamberSphere to take ownership of the
+   * active stress model.
+   *
+   * @param as Unique pointer to the active stress model (caller transfers
+   * ownership)
+   */
+  virtual void set_active_stress(std::unique_ptr<ActiveStress> as) {
+    (void)as;  // Included to avoid unused parameter warning
   }
 
   /**
