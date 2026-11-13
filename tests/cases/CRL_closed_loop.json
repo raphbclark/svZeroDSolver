@@ -1,0 +1,126 @@
+{
+  "description": {
+    "description of test case": "runs a closed-loop 0D model of a cardiac chamber with inlet and outlet valves connected to arterial and vascuallr vessel segments"
+  },
+  "simulation_parameters": {
+    "number_of_cardiac_cycles": 10,
+    "number_of_time_pts_per_cardiac_cycle": 500,
+    "steady_initial": false,
+    "output_variable_based": true,
+    "absolute_tolerance": 1e-9,
+    "output_all_cycles": true,
+    "cardiac_period": 1.0,
+    "max_iter_error_to_warning": true 
+  },
+  "boundary_conditions": [
+    {
+      "bc_name": "ref_pressure",
+      "name": "ref_pressure",
+      "bc_type": "PRESSURE",
+      "bc_values": {
+        "t": [0.0, 1.0],
+        "P": [0.0, 0.0]
+      }
+    }
+  ],
+  "vessels": [
+    {
+      "vessel_id": 0,
+      "vessel_name": "vasc_vessel",
+      "name": "vasc_vessel",
+      "vessel_length": 4.0,
+      "zero_d_element_type": "BloodVessel",
+      "zero_d_element_values": {
+        "R_poiseuille": 1.0e6,
+        "C": 1.0e-9,
+        "L": 10.0
+      }
+    },
+    {
+      "vessel_id": 1,
+      "vessel_name": "ground_vessel",
+      "name": "ground_vessel",
+      "vessel_length": 1.0,
+      "zero_d_element_type": "BloodVessel",
+      "zero_d_element_values": {
+        "R_poiseuille": 1.0,
+        "C": 0.0,
+        "L": 0.0
+      },
+      "boundary_conditions": {
+        "outlet": "ref_pressure"
+      }
+    },
+    {
+      "vessel_id": 2,
+      "vessel_name": "art_vessel",
+      "name": "art_vessel",
+      "vessel_length": 4.0,
+      "zero_d_element_type": "BloodVessel",
+      "zero_d_element_values": {
+        "R_poiseuille": 1.0e7,
+        "C": 1.0e-9,
+        "L": 10.0
+      }
+    }
+  ],
+  "chambers": [
+    {
+      "type": "ChamberSphere",
+      "name": "ventricle",
+      "values": {
+        "rho": 1e3,
+        "thick0": 0.01,
+        "radius0": 0.05,
+        "eta": 10.0,
+        "sigma_max": 185e3,
+        "alpha_max": 30.0,
+        "alpha_min": -30.0
+      },
+      "activation_function": {
+        "type": "double_tanh",
+        "tsys": 0.17,
+        "tdias": 0.484,
+        "steepness": 0.005
+      },
+      "material": {
+        "type": "mooney_rivlin",
+        "W1": 10e3,
+        "W2": 40
+      }
+    }
+  ],
+  "valves": [
+    {
+      "type": "ValveTanh",
+      "name": "inlet_valve",
+      "params": {
+        "Rmax": 7e8,
+        "Rmin": 0,
+        "Steepness": 5.75e-4,
+        "upstream_block": "vasc_vessel",
+        "downstream_block": "ventricle"
+      }
+    },
+    {
+      "type": "ValveTanh",
+      "name": "outlet_valve",
+      "params": {
+        "Rmax": 6.665e9,
+        "Rmin": 0,
+        "Steepness": 5.75e-4,
+        "upstream_block": "ventricle",
+        "downstream_block": "art_vessel"
+      }
+    }
+  ],
+  "junctions": [
+    {
+      "junction_name": "J_systemic",
+      "name": "J_systemic",
+      "junction_type": "NORMAL_JUNCTION",
+      "inlet_vessels": [2],
+      "outlet_vessels": [0, 1]
+    }
+  ]
+}
